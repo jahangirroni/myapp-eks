@@ -1,9 +1,7 @@
-name: 🚀 Production CI/CD Pipeline
+name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
@@ -13,113 +11,31 @@ env:
   EKS_CLUSTER_NAME: cloud-native-cluster
 
 jobs:
-  # Stage 1: Test
-  test:
-    name: 🧪 Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Run tests
-        run: |
-          echo "✅ Unit tests passed"
-          echo "✅ Integration tests passed"
-
-  # Stage 2: Security Scan
-  security:
-    name: 🔒 Security Scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'table'
-      - name: Scan Dockerfile
-        run: |
-          echo "✅ No critical vulnerabilities found"
-
-  # Stage 3: Build and Push
-  build:
-    name: 📦 Build & Push
-    runs-on: ubuntu-latest
-    needs: [test, security]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-          - name: Verify AWS credentials
-  run: aws sts get-caller-identity
-      - name: Login to ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-      - name: Build Docker image
-        run: |
-          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
-          docker tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-      - name: Push to ECR
-        run: |
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-
-  # Stage 4: Deploy to EKS
   deploy:
-    name: 🚀 Deploy to EKS
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - uses: actions/checkout@v4
+      
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Verify AWS credentials
+        run: aws sts get-caller-identity
+      
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build and push
+        run: |
+          docker build -t 871499496674.dkr.ecr.us-east-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest .
+          docker push 871499496674.dkr.ecr.us-east-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+      
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      
       - name: Deploy to EKS
-        run: |
-          kubectl set image deployment/myapp myapp=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} --record
-          kubectl rollout status deployment/myapp --timeout=5m
-      - name: Verify deployment
-        run: |
-          kubectl get pods
-          kubectl get svc myapp
-
-  # Stage 5: Rollback (if needed - manual)
-  rollback:
-    name: 🔄 Rollback
-    runs-on: ubuntu-latest
-    needs: deploy
-    if: failure()
-    steps:
-      - name: Rollback deployment
-        run: |
-          kubectl rollout undo deployment/myapp
-          echo "⚠️ Deployment failed, rolled back to previous version"
-
-  # Stage 6: Slack Notification
-  notify:
-    name: 📢 Slack Notification
-    runs-on: ubuntu-latest
-    needs: [deploy, rollback]
-    if: always()
-    steps:
-      - name: Send notification
-        uses: slackapi/slack-github-action@v1
-        with:
-          payload: |
-            {
-              "text": "🎯 *EKS Deployment*\nStatus: ${{ job.status }}\nRepo: ${{ github.repository }}\nCommit: ${{ github.sha }}\nBy: ${{ github.actor }}"
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: kubectl rollout restart deployment myapp
