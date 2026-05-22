@@ -1,18 +1,122 @@
-name: 🚀 Production CI/CD Pipeline
+name: Production-Grade CI/CD Pipeline
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: myapp
   EKS_CLUSTER: cloud-native-cluster
+  K8S_NAMESPACE: myapp
+
+permissions:
+  contents: read
+  security-events: write
 
 jobs:
-  deploy:
+  lint:
+    name: Lint & Style Check
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install flake8
+      - run: flake8 app.py --max-line-length=120 --ignore=E501,W293,E402
+
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          pip install pytest pytest-cov
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - run: pytest --cov=. --cov-report=term || true
+
+  security-scan:
+    name: Container Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t myapp:scan .
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          image-ref: myapp:scan
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: trufflesecurity/trufflehog@v3.78.0
+        with:
+          path: ./
+
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [lint, test, security-scan, secrets-scan]
+    outputs:
+      IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+      IMAGE_URI: ${{ steps.build.outputs.uri }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Generate image tag
+        id: tag
+        run: |
+          TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "tag=${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+      - name: Build & Push Image
+        id: build
+        run: |
+          URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
+          docker build -t $URI .
+          docker tag $URI ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          docker push $URI
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          echo "uri=$URI" >> $GITHUB_OUTPUT
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    environment: staging
     steps:
       - uses: actions/checkout@v4
       - name: Configure AWS
@@ -21,15 +125,80 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@v2
-      - name: Build and push
-        run: |
-          docker build -t 871499496674.dkr.ecr.us-east-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest .
-          docker push 871499496674.dkr.ecr.us-east-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
-      - name: Deploy to EKS
+      - name: Deploy to Staging
         run: |
-          kubectl rollout restart deployment myapp
-          kubectl rollout status deployment myapp
+          kubectl set image deployment/myapp myapp=${{ needs.build.outputs.IMAGE_URI }} -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout status deployment/myapp -n ${{ env.K8S_NAMESPACE }} --timeout=5m
+      - name: Smoke Test
+        run: |
+          for i in {1..20}; do
+            URL=$(kubectl get svc myapp -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$URL" ]; then break; fi
+            sleep 15
+          done
+          curl --retry 10 --retry-delay 10 --fail http://$URL/health
+
+  approval:
+    name: Manual Approval
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    environment: production
+    steps:
+      - run: echo "Waiting for manual approval"
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging, approval]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+      - name: Deploy to Production
+        run: |
+          kubectl set image deployment/myapp myapp=${{ needs.build.outputs.IMAGE_URI }} -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout status deployment/myapp -n ${{ env.K8S_NAMESPACE }} --timeout=5m
+
+  rollback:
+    name: Auto Rollback
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: failure()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Rollback
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+          kubectl rollout undo deployment/myapp -n ${{ env.K8S_NAMESPACE }}
+
+  notify:
+    name: Slack Notification
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging, deploy-production, rollback]
+    if: always()
+    steps:
+      - uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🚀 Deployment Report\nEnvironment: ${{ github.event.inputs.environment || 'staging' }}\nStatus: ${{ job.status }}\nImage: ${{ needs.build.outputs.IMAGE_URI }}\nCommit: ${{ github.sha }}\nActor: ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
