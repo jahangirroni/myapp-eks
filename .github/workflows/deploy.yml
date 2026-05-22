@@ -1,4 +1,5 @@
-name: 🚀 Production-Grade CI/CD Pipeline
+cat > .github/workflows/deploy.yml << 'EOF'
+name: 🏭 Production-Grade CI/CD Pipeline
 
 on:
   push:
@@ -8,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Target environment'
+        description: 'Deployment Environment'
         required: true
         default: 'staging'
         type: choice
@@ -18,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
   security-events: write
 
 env:
@@ -26,45 +28,49 @@ env:
   EKS_CLUSTER: cloud-native-cluster
 
 jobs:
-  # ========== STAGE 1: LINT & TEST ==========
+  # ============================================================
+  # STAGE 1: CODE QUALITY & SECURITY (Parallel)
+  # ============================================================
+  
   lint:
-    name: 🔍 Lint & Style
+    name: 🔍 Lint
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install flake8
-        run: pip install flake8
-      - name: Run linting (non-blocking)
-        run: flake8 . --count --max-complexity=10 --statistics --ignore=E501 || true
+      - name: Install linters
+        run: pip install flake8 black
+      - name: Run flake8
+        run: flake8 . --count --max-complexity=10 --statistics || true
+      - name: Run black (format check)
+        run: black --check . || true
 
-  test:
+  unit-tests:
     name: 🧪 Unit Tests
     runs-on: ubuntu-latest
-    needs: lint
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          pip install pytest
+          pip install pytest pytest-cov
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - name: Run tests
-        run: pytest || echo "No tests found - skipping"
+      - name: Run tests with coverage
+        run: |
+          pytest --cov=. --cov-report=xml --cov-report=term || true
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
 
-  # ========== STAGE 2: SECURITY SCAN ==========
   security-sast:
-    name: 🔒 SAST Scan (CodeQL)
+    name: 🔒 SAST (CodeQL)
     runs-on: ubuntu-latest
-    permissions:
-      security-events: write
     steps:
       - uses: actions/checkout@v4
       - name: Initialize CodeQL
@@ -74,19 +80,17 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
-  security-trivy:
+  security-container:
     name: 🐳 Container Scan (Trivy)
     runs-on: ubuntu-latest
-    permissions:
-      security-events: write
     steps:
       - uses: actions/checkout@v4
       - name: Build Docker image
-        run: docker build -t myapp:test .
-      - name: Run Trivy vulnerability scan
+        run: docker build -t myapp:scan .
+      - name: Run Trivy scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: myapp:test
+          image-ref: myapp:scan
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
@@ -95,13 +99,32 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
-  # ========== STAGE 3: BUILD & PUSH ==========
-  build:
-    name: 📦 Build & Push to ECR
+  security-secrets:
+    name: 🕵️ Secrets Detection
     runs-on: ubuntu-latest
-    needs: [test, security-sast, security-trivy]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        continue-on-error: true
+        with:
+          path: ./
+          base: main
+          head: ${{ github.sha }}
+
+  # ============================================================
+  # STAGE 2: BUILD & PUSH (Waits for quality checks)
+  # ============================================================
+  
+  build:
+    name: 📦 Build & Push
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests, security-sast, security-container, security-secrets]
     outputs:
-      image_tag: ${{ steps.image-tag.outputs.tag }}
+      image_tag: ${{ steps.tag.outputs.tag }}
+      image_digest: ${{ steps.digest.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       
@@ -112,35 +135,46 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
-      - name: Login to ECR
-        id: login-ecr
+      - name: Login to Amazon ECR
+        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
       
       - name: Generate image tag
-        id: image-tag
+        id: tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "tag=${{ github.event.inputs.environment }}-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_name }}" = "main" ]; then
+            echo "tag=prod-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
           else
-            echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+            echo "tag=dev-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
           fi
       
       - name: Build Docker image
         run: |
-          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }} .
-          docker tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          docker build -t ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }} .
+          docker tag ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }} ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
       
       - name: Push to ECR
         run: |
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }}
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+      
+      - name: Get image digest
+        id: digest
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }} | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
-  # ========== STAGE 4: DEPLOY TO STAGING ==========
+  # ============================================================
+  # STAGE 3: DEPLOY TO STAGING
+  # ============================================================
+  
   deploy-staging:
     name: 🚀 Deploy to Staging
     runs-on: ubuntu-latest
     needs: build
-    if: success()
+    if: github.ref_name == 'develop' || github.event.inputs.environment == 'staging'
     environment: staging
     steps:
       - uses: actions/checkout@v4
@@ -159,27 +193,100 @@ jobs:
         run: |
           kubectl set image deployment/myapp myapp=${{ needs.build.outputs.image_tag }} --record
           kubectl rollout status deployment/myapp --timeout=5m
+      
+      - name: Get service URL
+        id: svc
+        run: |
+          URL=$(kubectl get svc myapp -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "url=http://$URL" >> $GITHUB_OUTPUT
+      
+      - name: Health check
+        run: |
+          curl --retry 5 --retry-delay 10 --fail ${{ steps.svc.outputs.url }}/health
+          echo "✅ Health check passed"
 
-  # ========== STAGE 5: SMOKE TEST ==========
-  smoke-test:
-    name: 🔥 Smoke Test
+  # ============================================================
+  # STAGE 4: MANUAL APPROVAL (Production only)
+  # ============================================================
+  
+  approval-prod:
+    name: ⏸️ Approval Required
     runs-on: ubuntu-latest
     needs: deploy-staging
+    if: github.event.inputs.environment == 'production' || github.ref_name == 'main'
+    environment: production
     steps:
-      - name: Get Service URL
-        run: |
-          EXTERNAL_IP=$(kubectl get svc myapp -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-          echo "EXTERNAL_IP=$EXTERNAL_IP" >> $GITHUB_ENV
-      - name: Test endpoint
-        run: |
-          curl --retry 5 --retry-delay 10 --fail http://${{ env.EXTERNAL_IP }}
-          echo "✅ Smoke test passed"
+      - name: Wait for approval
+        run: echo "⏳ Manual approval required before deploying to production"
 
-  # ========== STAGE 6: SLACK NOTIFICATION ==========
+  # ============================================================
+  # STAGE 5: DEPLOY TO PRODUCTION
+  # ============================================================
+  
+  deploy-production:
+    name: 🌍 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: approval-prod
+    if: success()
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+      
+      - name: Deploy to Production
+        run: |
+          kubectl set image deployment/myapp myapp=${{ needs.build.outputs.image_tag }}
+          kubectl rollout status deployment/myapp --timeout=5m
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods
+          kubectl get svc myapp
+
+  # ============================================================
+  # STAGE 6: ROLLBACK (Auto on failure)
+  # ============================================================
+  
+  rollback:
+    name: 🔄 Rollback
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: failure()
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+      
+      - name: Rollback deployment
+        run: |
+          kubectl rollout undo deployment/myapp
+          echo "⚠️ Deployment failed - rolled back to previous version"
+
+  # ============================================================
+  # STAGE 7: NOTIFICATIONS
+  # ============================================================
+  
   slack-notify:
     name: 📢 Slack Notification
     runs-on: ubuntu-latest
-    needs: [deploy-staging, smoke-test]
+    needs: [deploy-staging, deploy-production, rollback]
     if: always()
     steps:
       - name: Send notification
@@ -187,7 +294,8 @@ jobs:
         with:
           payload: |
             {
-              "text": "🎯 *Deployment Report*\nEnvironment: ${{ github.event.inputs.environment || github.ref_name }}\nStatus: ${{ job.status }}\nRepo: ${{ github.repository }}\nBy: ${{ github.actor }}"
+              "text": "🎯 *Deployment Report*\nEnvironment: ${{ github.event.inputs.environment || github.ref_name }}\nStatus: ${{ job.status }}\nImage: ${{ needs.build.outputs.image_tag }}\nRepo: ${{ github.repository }}\nBy: ${{ github.actor }}\nCommit: ${{ github.sha }}"
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+EOF
